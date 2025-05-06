@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Thesis\MessageBus\Transport\Amqp;
 
-use Amp\Future;
 use Thesis\Amqp\Channel;
 use Thesis\Amqp\Client;
 use Thesis\Amqp\DeliveryMessage;
@@ -12,7 +11,6 @@ use Thesis\Amqp\PublishMessage;
 use Thesis\Message\Command;
 use Thesis\MessageBus\Envelope;
 use Thesis\MessageBus\Transport\Transport;
-use function Amp\async;
 
 /**
  * @api
@@ -20,17 +18,25 @@ use function Amp\async;
 final class AmqpTransport implements Transport
 {
     /**
-     * @var ?Future<Channel>
+     * @var SimpleMutex<Channel>
      */
-    private ?Future $publishChannelFuture = null;
-
-    private ?Channel $publishChannel = null;
+    private SimpleMutex $publishChannel;
 
     public function __construct(
         private readonly Client $client,
         private readonly ExchangeNaming $exchangeNaming = new MessageClassBasedExchangeNaming(),
         private readonly AmqpEnvelopeEncoder $encoder = new DefaultAmqpEnvelopeEncoder(),
-    ) {}
+    ) {
+        $this->publishChannel = new SimpleMutex(
+            factory: function (): Channel {
+                $channel = $this->client->channel();
+                $channel->confirmSelect();
+
+                return $channel;
+            },
+            isHit: static fn(Channel $channel): bool => !$channel->isClosed(),
+        );
+    }
 
     public function setup(string $endpoint, array $localMessages): void
     {
@@ -64,22 +70,7 @@ final class AmqpTransport implements Transport
 
     public function publish(array $envelopes): void
     {
-        if ($this->publishChannel === null || $this->publishChannel->isClosed()) {
-            $this->publishChannelFuture ??= async(function (): Channel {
-                $channel = $this->client->channel();
-                $channel->confirmSelect();
-
-                return $channel;
-            });
-
-            try {
-                $this->publishChannel = $this->publishChannelFuture->await();
-            } finally {
-                $this->publishChannelFuture = null;
-            }
-        }
-
-        $channel = $this->publishChannel;
+        $channel = $this->publishChannel->get();
         $channel
             ->publishBatch(array_map(
                 function (Envelope $envelope) use ($channel): PublishMessage {
